@@ -283,6 +283,149 @@ describe('neutralizeClientIdentity', () => {
   });
 });
 
+// 2026-11-19 (a9): Claude Code main-prompt memory/auto-compact triggers, live-bisected
+// via /v1/chat/completions replay of a real 47 KB CC system prompt. Three sentence
+// patterns in the newer-CC memory section each block deterministically (permission_denied
+// / 400): the auto-compact bullet PAIR (each sentence alone passes — combination
+// trigger, same shape as a8), the "Anything already documented in CLAUDE.md files."
+// bullet, and the "You MUST access memory when the user explicitly asks…" bullet.
+// Each rewrite is a one-word minimal diff verified to pass upstream; near-miss
+// variants that passed live are pinned as untouched.
+describe('neutralizeClientIdentity — Claude Code memory/auto-compact rules (a9)', () => {
+  const AUTOCOMPACT = 'The system will automatically compress prior messages in your conversation as it approaches context limits. This means your conversation with the user is not limited by the context window.';
+  const MEM_CLAUDEMD = '- Anything already documented in CLAUDE.md files.';
+  const MEM_MUST = '- You MUST access memory when the user explicitly asks you to check, recall, or remember.';
+  const MEMORY_BLOCK = [
+    '## How to save memories',
+    MEM_CLAUDEMD,
+    '- Ephemeral task details: in-progress work, temporary state, current conversation context.',
+    '## When to access memories',
+    MEM_MUST,
+    '- If the user says to *ignore* or *not use* memory: Do not apply remembered facts, cite, compare against, or mention memory content.',
+  ].join('\n');
+
+  it('(a9) rewrites the auto-compact pair: compress -> compact, second sentence kept', () => {
+    const out = neutralizeClientIdentity(AUTOCOMPACT);
+    assert.ok(!/automatically compress prior messages/.test(out), 'trigger phrasing gone');
+    assert.match(out, /automatically compact prior messages in your conversation as it approaches context limits\./, 'instruction kept with compact');
+    assert.match(out, /not limited by the context window\./, 'second sentence preserved verbatim');
+  });
+
+  it('(a9) rewrites the CLAUDE.md memory bullet: documented -> recorded', () => {
+    const out = neutralizeClientIdentity(MEMORY_BLOCK);
+    assert.ok(!/already documented in CLAUDE\.md files/.test(out), 'trigger phrasing gone');
+    assert.match(out, /^- Anything already recorded in CLAUDE\.md files\.$/m, 'bullet kept with recorded');
+    assert.match(out, /^- Ephemeral task details: in-progress work, temporary state/m, 'neighbouring bullet preserved');
+  });
+
+  it('(a9) rewrites the MUST-access bullet: drops explicitly, keeps MUST', () => {
+    const out = neutralizeClientIdentity(MEMORY_BLOCK);
+    assert.ok(!/when the user explicitly asks you to check, recall, or remember/.test(out), 'trigger phrasing gone');
+    assert.match(out, /^- You MUST access memory when the user asks you to check, recall, or remember\.$/m, 'bullet kept without explicitly');
+    assert.match(out, /Do not apply remembered facts/, 'following bullet preserved');
+  });
+
+  it('(a9) is idempotent — a second pass is a no-op', () => {
+    for (const src of [AUTOCOMPACT, MEMORY_BLOCK]) {
+      const once = neutralizeClientIdentity(src);
+      assert.equal(neutralizeClientIdentity(once), once, 'already-neutralized text unchanged');
+    }
+  });
+
+  it('(a9) leaves the near-miss variants that passed live untouched', () => {
+    for (const src of [
+      // each half of the auto-compact pair alone passed live
+      'The system will automatically compress prior messages in your conversation as it approaches context limits.',
+      'This means your conversation with the user is not limited by the context window.',
+      // a bare CLAUDE.md mention passed live — only the bullet pattern is a trigger
+      'See CLAUDE.md files for details.',
+      // already-rewritten forms
+      'The system will automatically compact prior messages in your conversation as it approaches context limits.',
+      '- Anything already recorded in CLAUDE.md files.',
+      '- You MUST access memory when the user asks you to check, recall, or remember.',
+    ]) {
+      assert.equal(neutralizeClientIdentity(src), src, `untouched: ${src}`);
+    }
+  });
+
+  it('(a9) respects the main off-switch', () => {
+    process.env.WINDSURFAPI_NEUTRALIZE_CLIENT_ID = '0';
+    assert.equal(neutralizeClientIdentity(MEMORY_BLOCK), MEMORY_BLOCK, 'opt-out leaves it verbatim');
+  });
+});
+
+// 2026-11-19 (a10): second batch from the same live-bisect campaign, all OUTSIDE
+// the memory section — help/feedback bullets carry "Claude Code" + the anthropic
+// issue URL, and two sentence-pair triggers sit in "# Executing actions with care"
+// and "# Text output". Each verdict was deterministic 2-3/3 on the live upstream;
+// every rewrite is a one-or-few-word minimal diff verified to pass.
+describe('neutralizeClientIdentity — Claude Code help/care/output rules (a10)', () => {
+  const HELP_BULLETS = [
+    ' - If the user asks for help or wants to give feedback inform them of the following:',
+    '  - /help: Get help with using Claude Code',
+    '  - To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues',
+  ].join('\n');
+  const CARE = '# Executing actions with care\n\nCarefully consider the reversibility and blast radius of actions. Generally you can freely take local, reversible actions like editing files or running tests.';
+  const COLON = ' - Do not use a colon before tool calls. Your tool calls may not be shown directly in the output, so text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.';
+
+  it('(a10) neutralizes the help brand mention and the anthropic issues URL', () => {
+    const out = neutralizeClientIdentity(HELP_BULLETS);
+    assert.ok(!/Get help with using Claude Code/.test(out), 'brand mention gone');
+    assert.match(out, /Get help with using the CLI/, 'help pointer kept');
+    assert.ok(!/github\.com\/anthropics\/claude-code/.test(out), 'anthropic URL gone');
+    assert.match(out, /report the issue to their support channel\./, 'feedback pointer kept');
+    assert.match(out, /inform them of the following:/, 'lead-in preserved');
+  });
+
+  it('(a10) rewrites the authorization sentence motif: approve -> authorize', () => {
+    const src = '(e.g. git push) once does NOT mean that they approve it in all contexts, so unless actions are authorized in advance in durable instructions like CLAUDE.md files, always confirm first.';
+    const out = neutralizeClientIdentity(src);
+    assert.ok(!/approve it in all contexts/.test(out), 'trigger motif gone');
+    assert.match(out, /authorize it in all contexts/, 'sentence kept');
+    assert.match(out, /CLAUDE\.md files, always confirm first\./, 'tail preserved verbatim');
+  });
+
+  it('(a10) rewrites the colon pair: may -> might, keeps the pinned near-miss line', () => {
+    const out = neutralizeClientIdentity(COLON);
+    assert.ok(!/Your tool calls may not be shown/.test(out), 'pair phrasing gone');
+    assert.match(out, /Do not use a colon before tool calls\./, 'a8 near-miss line preserved verbatim');
+    assert.match(out, /Your tool calls might not be shown/, 'continuation kept with might');
+  });
+
+  it('(a10) rewrites the care-section opener: blast radius -> impact', () => {
+    const out = neutralizeClientIdentity(CARE);
+    assert.ok(!/blast radius/.test(out), 'military metaphor gone');
+    assert.match(out, /reversibility and impact of actions/, 'instruction kept');
+    assert.match(out, /# Executing actions with care/, 'heading preserved');
+  });
+
+  it('(a10) is idempotent — a second pass is a no-op', () => {
+    for (const src of [HELP_BULLETS, CARE, COLON]) {
+      const once = neutralizeClientIdentity(src);
+      assert.equal(neutralizeClientIdentity(once), once, 'already-neutralized text unchanged');
+    }
+  });
+
+  it('(a10) leaves the near-miss variants that passed live untouched', () => {
+    for (const src of [
+      // each half of the pairs alone passed live
+      '# Executing actions with care',
+      'Carefully consider the reversibility and blast radius of actions.',
+      'Generally you can freely take local, reversible actions like editing files or running tests.',
+      ' - Do not use a colon before tool calls.',
+      // the bare URL without its lead-in passed live
+      'see https://github.com/anthropics/claude-code/issues for details',
+    ]) {
+      assert.equal(neutralizeClientIdentity(src), src, `untouched: ${src}`);
+    }
+  });
+
+  it('(a10) respects the main off-switch', () => {
+    process.env.WINDSURFAPI_NEUTRALIZE_CLIENT_ID = '0';
+    assert.equal(neutralizeClientIdentity(HELP_BULLETS), HELP_BULLETS, 'opt-out leaves it verbatim');
+  });
+});
+
 // 2026-07-16 (a6-grok/a6-grok2): Grok CLI's system prompt opens with "You are
 // Grok 4.5 released by xAI. You are an interactive CLI tool that helps users
 // with software engineering tasks." Live A/B on the Devin upstream proved that

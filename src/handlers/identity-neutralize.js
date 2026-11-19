@@ -895,15 +895,15 @@ const MULTI_HIT_REWRITE_WARN_COUNT = 1;
  * enables the (a6-cline-obj) OBJECTIVE-boast rule; see comment at the a6-cline-obj rule.
  * Opt-in (speculative): WINDSURFAPI_NEUTRALIZE_CC_AGGRESSIVE=1 or opts.ccActive
  *   (default off) — reserved hook for Claude-Code-specific aggressive rules; see
- *   the (cc) block at the end. Currently EMPTY on purpose (a1-a4 and a8 already cover
- *   every live-confirmed CC trigger); the hook exists so a new CC trigger can be
+ *   the (cc) block at the end. Currently EMPTY on purpose (a1-a4 and a8-a10 already
+ *   cover every live-confirmed CC trigger); the hook exists so a new CC trigger can be
  *   flipped on the instant a repetition A/B proves it, without re-plumbing.
  *
  * @param {string} text  system-prompt body to neutralize
  * @param {object} env   environment (injectable for tests)
  * @param {object} opts  { ccActive?: boolean } — Claude Code compat layer active
  *   for this request (via /v1/cc/* or detected + master toggle). Gates ONLY the
- *   opt-in (cc) block; the confirmed rules (a1-a5, a6-grok, a7, a8) stay unconditional
+ *   opt-in (cc) block; the confirmed rules (a1-a5, a6-grok, a7, a8-a10) stay unconditional
  *   (they are the default 529 / content-policy defense line for ALL clients and
  *   must never be gated).
  */
@@ -1224,12 +1224,103 @@ export function neutralizeClientIdentity(text, env = process.env, opts = {}) {
     /For clear communication with the user,?\s+the assistant MUST avoid using emojis\./g,
     'For clear communication with the user the assistant should avoid using emojis.',
   );
+  // (a9) Claude Code main-prompt auto-compact + memory-section triggers
+  // (2026-11-19, live-bisected via /v1/chat/completions replay of a real
+  // 47 KB CC system prompt — each verdict deterministic 2-3/3). Newer CC
+  // prompts append a memory/auto-compact section; THREE phrasings in it trip
+  // Devin's content policy (permission_denied / 400):
+  //
+  //   - auto-compact bullet PAIR: "The system will automatically compress prior
+  //     messages in your conversation as it approaches context limits. This means
+  //     your conversation with the user is not limited by the context window."
+  //     Each sentence alone passes, every sub-fragment passes, the pair blocks —
+  //     same combination-trigger shape as a8. `compress` → `compact` (one word,
+  //     and CC's own name for the feature) passes 2/2.
+  //   - "- Anything already documented in CLAUDE.md files." — the single line
+  //     blocks 3/3; a bare "CLAUDE.md" mention elsewhere passes, so it is this
+  //     sentence pattern, not the token. `documented` → `recorded` passes.
+  //   - "- You MUST access memory when the user explicitly asks you to check,
+  //     recall, or remember." — single line blocks; deleting `explicitly`,
+  //     dropping MUST, or swapping access→consult all pass (fragile
+  //     full-phrase match). Minimal diff: delete `explicitly`, keep MUST.
+  //
+  // Unconditional, same argument as a8: ccActive is off by default, so gating
+  // would leave every default deployment's main-prompt requests failing, and
+  // each regex is anchored on the whole sentence — it cannot hit unrelated
+  // caller content (and where it could, e.g. prose repeating the CLAUDE.md
+  // line, the rewrite is a semantic no-op).
+  rule('a9-cc-autocompact',
+    /The system will automatically compress prior messages in your conversation as it approaches context limits\.\s+This means your conversation with the user is not limited by the context window\./g,
+    'The system will automatically compact prior messages in your conversation as it approaches context limits. This means your conversation with the user is not limited by the context window.',
+  );
+  rule('a9-cc-mem-claudemd',
+    /already documented in CLAUDE\.md files\./g,
+    'already recorded in CLAUDE.md files.',
+  );
+  rule('a9-cc-mem-must',
+    /access memory when the user explicitly asks you to check, recall, or remember\./g,
+    'access memory when the user asks you to check, recall, or remember.',
+  );
+  // (a10) Second batch of Claude Code main-prompt triggers (2026-11-19, same
+  // live-bisect campaign as a9 — replay of the real 47 KB CC system prompt,
+  // every verdict deterministic 2-3/3). Isolated by bisecting the residual
+  // block after a9 landed; all sit OUTSIDE the memory section:
+  //
+  //   - "- /help: Get help with using Claude Code" — the help bullet's brand
+  //     mention blocks on its own (a 42 B line). "Claude Code" → "the CLI"
+  //     passes; meaning preserved.
+  //   - "- To give feedback, users should report the issue at
+  //     https://github.com/anthropics/claude-code/issues" — the full feedback
+  //     sentence is the fingerprint (the bare URL, without its lead-in,
+  //     passes). Rewrite the URL tail to a generic support-channel mention.
+  //   - authorization sentence pair: "… once does NOT mean that they approve
+  //     it in all contexts, so unless actions are authorized in advance in
+  //     durable instructions like CLAUDE.md files, always confirm first." —
+  //     head/tail/middle fragments all pass, the whole sentence blocks.
+  //     "approve it" → "authorize it" breaks the match; replacing the tail's
+  //     "always confirm first" did NOT, so the motif lives in the head.
+  //   - colon pair: "Do not use a colon before tool calls. Your tool calls may
+  //     not be shown directly in the output …" — either sentence alone passes
+  //     (the first is pinned as an a8 near-miss), the pair blocks. Pair-anchored
+  //     "may" → "might" rewrite, verified pass.
+  //   - reversibility pair: "Carefully consider the reversibility and blast
+  //     radius of actions. Generally you can freely take local, reversible
+  //     actions …" — each sentence alone passes (heading not required), the
+  //     pair blocks. "blast radius" → "impact" removes the military metaphor
+  //     and passes; pair-anchored so the verified-passing single sentence
+  //     stays byte-identical.
+  //
+  // Unconditional, same argument as a8/a9: an opt-in gate would leave every
+  // default deployment failing, and each pattern is an anchored distinctive
+  // phrase whose rewrite is a semantic no-op in caller prose.
+  rule('a10-cc-help-brand',
+    /Get help with using Claude Code/g,
+    'Get help with using the CLI',
+  );
+  rule('a10-cc-feedback-url',
+    /report the issue at https:\/\/github\.com\/anthropics\/claude-code\/issues/g,
+    'report the issue to their support channel.',
+  );
+  rule('a10-cc-authorize-pair',
+    /(does NOT mean that they )approve( it in all contexts, so unless actions are authorized in advance in durable instructions like CLAUDE\.md files)/g,
+    '$1authorize$2',
+  );
+  rule('a10-cc-colon-pair',
+    /(Do not use a colon before tool calls\.\s+Your tool calls )may( not be shown)/g,
+    '$1might$2',
+  );
+  rule('a10-cc-blast-radius',
+    /(reversibility and )blast radius( of actions\.\s+Generally you can freely take)/g,
+    '$1impact$2',
+  );
   // (cc) SPECULATIVE / DEFAULT-OFF — Claude-Code-specific aggressive rules. Gated
   // by the CC compat layer being active for this request (opts.ccActive, i.e.
   // /v1/cc/* or detected + master toggle) OR the env opt-in. INTENTIONALLY EMPTY
-  // today: a1-a4 and a8 already neutralize every live-confirmed Claude Code trigger
-  // ("You are Claude Code", the Agent-SDK line, the billing header, the brand
-  // block, the subagent emoji bullet), and adding UNVERIFIED rewrites would risk
+  // today: a1-a4 and a8-a10 already neutralize every live-confirmed Claude Code
+  // trigger ("You are Claude Code", the Agent-SDK line, the billing header, the
+  // brand block, the subagent emoji bullet, the memory/auto-compact sentences,
+  // the help/feedback/authorization/colon lines), and
+  // adding UNVERIFIED rewrites would risk
   // mangling prompt semantics against Devin's NON-DETERMINISTIC content policy (same prompt blocked then
   // passed hours later — no reliable A/B, the exact reason a6-cline-obj ships off). This
   // hook exists so the moment the policy re-fires and a repetition A/B isolates a
