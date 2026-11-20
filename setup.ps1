@@ -1,5 +1,6 @@
 ﻿# WindsurfAPI Windows 一键脚本 —— setup.sh 的 Windows 版。
-# 菜单:[1] 配置环境 / [2] 编译打包 / [3] 启动服务 / [4] 一键全部(1→2→3)/ [0] 退出。
+# 菜单:[1] 配置环境 / [2] 编译打包 / [3] 启动服务 / [4] 一键全部(1→2→3)
+#      / [5] 状态检查 / [6] 重启服务 / [7] 停止服务 / [0] 退出。
 # 双击 setup.bat 启动(.bat 全 ASCII,中文只在本 .ps1,避免 GBK 码页乱码)。
 # 本文件必须以 UTF-8 带 BOM 保存,否则 Win PowerShell 5.1 按 ANSI 误读中文字面量。
 
@@ -313,10 +314,118 @@ function Invoke-Build {
   return $true
 }
 
+# ── 服务状态(端口归属 + 可选 /health 探活)────────────────────
+# 端口以 .env 的 PORT 为准(默认 3003)。-Probe 才打 /health(慢——
+# 菜单顶栏每次重绘都调本函数,不能每次等 HTTP)。
+function Get-ServiceState([switch]$Probe) {
+  $cfg  = if (Test-Path $EnvPath) { Read-EnvMap $EnvPath } else { @{} }
+  $port = if ($cfg['PORT']) { [int]$cfg['PORT'] } else { 3003 }
+  $state = [pscustomobject]@{
+    port = $port; listening = $false; pid = $null; procName = $null; cmdline = ''; health = $null
+  }
+  $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+  if ($listeners.Count -gt 0) {
+    $state.listening = $true
+    $state.pid = @($listeners | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique)[0]
+    try {
+      $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$($state.pid)" -ErrorAction Stop
+      $state.procName = $proc.Name
+      $state.cmdline  = [string]$proc.CommandLine
+    } catch {
+      $state.procName = (Get-Process -Id $state.pid -ErrorAction SilentlyContinue).ProcessName
+    }
+    if ($Probe) {
+      try { $state.health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 } catch { }
+    }
+  }
+  return $state
+}
+
+# ── [5] 状态检查 ─────────────────────────────────────────────
+function Invoke-Status {
+  Write-Host ''
+  Write-Host '===== [5] 状态检查 =====' -ForegroundColor Cyan
+  Write-Host ''
+  $s = Get-ServiceState -Probe
+  if (-not $s.listening) {
+    Write-Host "  [X] 服务未运行(端口 $($s.port) 无监听者)" -ForegroundColor Red
+    Write-Host '      用 [3] 启动,或 [6] 重启。' -ForegroundColor DarkGray
+    return
+  }
+  $mode = if ($s.cmdline -match 'windsurfapi\.exe') { '打包 exe (dist-windows)' }
+          elseif ($s.cmdline -match 'src[\\/]index\.js') { 'node 源码模式 (src/index.js)' }
+          else { '未知进程' }
+  Write-Host "  [OK] 服务运行中 —— 端口 $($s.port) 监听中" -ForegroundColor Green
+  Write-Host "      PID:      $($s.pid) ($($s.procName))"
+  Write-Host "      模式:     $mode"
+  Write-Host "      命令行:   $($s.cmdline)" -ForegroundColor DarkGray
+  if ($s.health) {
+    $h = $s.health
+    Write-Host "      /health:  status=$($h.status)  version=$($h.version)  uptime=$([int]$h.uptime)s  accounts=$($h.accounts.total)(active=$($h.accounts.active))" -ForegroundColor Green
+  } else {
+    Write-Host '      /health:  无响应 —— 端口被占但服务未就绪(可能在重试或假死)' -ForegroundColor Yellow
+  }
+  Write-Host ''
+  Write-Host "  >> 面板:  http://127.0.0.1:$($s.port)/dashboard" -ForegroundColor Cyan
+}
+
+# 停掉占用服务端口的所有进程并等端口释放。[6] 重启的内部步骤。
+function Stop-WindsurfService {
+  $s = Get-ServiceState
+  if (-not $s.listening) { Write-Host '  服务未在运行,无需停止。' -ForegroundColor DarkGray; return $true }
+  $pids = @(Get-NetTCPConnection -LocalPort $s.port -State Listen -ErrorAction SilentlyContinue |
+    ForEach-Object { $_.OwningProcess } | Sort-Object -Unique)
+  foreach ($p in $pids) {
+    $pn = (Get-Process -Id $p -ErrorAction SilentlyContinue).ProcessName
+    try {
+      Write-Host "  [..] 停止 PID $p ($pn)..."
+      Stop-Process -Id $p -Force -ErrorAction Stop
+    } catch {
+      Write-Host "  [!] 停止 PID $p 失败:$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+  }
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-NetTCPConnection -LocalPort $s.port -State Listen -ErrorAction SilentlyContinue)) { return $true }
+    Start-Sleep -Milliseconds 300
+  }
+  Write-Host '  [!] 端口仍未释放,放弃启动新实例。' -ForegroundColor Yellow
+  return $false
+}
+
+# ── [7] 停止服务(按端口关闭占用进程,不影响其它 node/exe)───
+function Invoke-Stop {
+  Write-Host ''
+  Write-Host '===== [7] 停止服务 =====' -ForegroundColor Cyan
+  if (Stop-WindsurfService) {
+    Write-Host '  [OK] 服务已停止。' -ForegroundColor Green
+  }
+}
+
+# ── [6] 重启服务(先按端口杀掉旧实例,再走 [3] 的启动流程)────
+function Invoke-Restart {
+  Write-Host ''
+  Write-Host '===== [6] 重启服务 =====' -ForegroundColor Cyan
+  if (Stop-WindsurfService) {
+    Write-Host '  [OK] 旧实例已停止,端口已释放。' -ForegroundColor Green
+    Invoke-Start
+  }
+}
+
 # ── [3] 启动服务(前台,Ctrl-C 停)───────────────────────────────
 function Invoke-Start {
   Write-Host ''
   Write-Host '===== [3] 启动服务 =====' -ForegroundColor Cyan
+
+  # 端口已有人监听 → 新实例只会空转重试绑定(node/exe 各自重试 10 次再死),
+  # 先拦下提醒,避免「启动了两份还不知道」。
+  $pre = Get-ServiceState
+  if ($pre.listening) {
+    Write-Host "[!] 端口 $($pre.port) 已被占用:PID $($pre.pid)($($pre.procName))。" -ForegroundColor Yellow
+    Write-Host '    到 [5] 查看状态,或用 [6] 重启替换它。' -ForegroundColor Yellow
+    $ans = Read-Host '    仍要强行再启一个实例吗?(y/N)'
+    if ($ans -ne 'y' -and $ans -ne 'Y') { return }
+  }
 
   if (-not (Test-Path $EnvPath)) {
     Write-Host '[!] 未找到 .env —— 空密钥 fail-closed,建议先执行 [1] 配置环境。' -ForegroundColor Yellow
@@ -372,12 +481,17 @@ while ($true) {
   $stNode = if ($stNode) { "v$stNode" } else { 'NOT FOUND' }
   $stEnv  = if (Test-Path $EnvPath) { 'OK' } else { 'missing' }
   $stExe  = if (Test-Path $ExePath) { 'built' } else { 'none' }
-  Write-Host "   Node: $stNode   |   .env: $stEnv   |   exe: $stExe" -ForegroundColor DarkGray
+  $svc = Get-ServiceState
+  $stSvc = if ($svc.listening) { "run PID $($svc.pid) :$($svc.port)" } else { 'stopped' }
+  Write-Host "   Node: $stNode   |   .env: $stEnv   |   exe: $stExe   |   svc: $stSvc" -ForegroundColor DarkGray
   Write-Host ''
   Write-Host '   [1] 配置环境    检查 Node + 生成 .env(自动密钥)'
   Write-Host '   [2] 编译打包    构建 dist-windows\windsurfapi.exe'
   Write-Host '   [3] 启动服务    前台运行(有 exe 用 exe,否则 node)'
   Write-Host '   [4] 一键全部    依次执行 1 -> 2 -> 3'
+  Write-Host '   [5] 状态检查    端口 / 进程 / 账号池 / 面板地址'
+  Write-Host '   [6] 重启服务    停掉端口占用进程后重新启动'
+  Write-Host '   [7] 停止服务    关闭占用该端口的服务进程'
   Write-Host '   [0] 退出'
   Write-Host ''
 
@@ -391,6 +505,9 @@ while ($true) {
       Invoke-Start
       Pause-Back
     }
+    '5' { Invoke-Status; Pause-Back }
+    '6' { Invoke-Restart; Pause-Back }
+    '7' { Invoke-Stop; Pause-Back }
     { $_ -in '0', 'q', 'Q', 'exit', 'quit' } { exit 0 }
     default { }
   }

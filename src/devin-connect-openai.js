@@ -351,6 +351,36 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
   // tail here counted every normal emulated `<tool_call>` turn as a stall
   // (the markup is stripped only downstream).
   const hasTools = Boolean(params?.tools?.length);
+  // Mid-stream resume — ported from WncFht/devin2api's tryResume (2026-11-20).
+  // When the upstream stream dies AFTER producing content (bare EOF →
+  // STREAM_TRUNCATED, mid-content stall → TIMEOUT, transport reset), re-send
+  // the request with the produced prefix echoed back as an assistant message
+  // plus a "continue" user message. Their live probes (incl. mid-sentence
+  // cuts) measured the upstream continuing generation from the cut, so the
+  // client keeps the prefix it already received and the continuation arrives
+  // on the same logical response — NO attempt_reset here.
+  //
+  // produced* are REQUEST-scoped (outside the attempt loop) so the echo covers
+  // every prior segment; they reset only where the client's view resets (the
+  // rescue arm's attempt_reset below). Own counter, same as rescue/empty —
+  // the #240 lesson was that shared counters miscount. Each hop still passes
+  // budget.takeTurn() at the loop head, and tool_choice is cleared per
+  // devin2api's measured lesson (a forced choice makes the upstream re-issue
+  // the same call on every hop).
+  //
+  // STREAMING ONLY (opts.streaming): a buffered client never saw the partial
+  // output, so for it a whole-request retry (clean regenerate, no echo) is
+  // strictly better — and is the pinned toChatCompletion contract ("no token
+  // duplication"). Once deltas have crossed the wire they cannot be
+  // retracted, so continuation-from-the-cut is the only honest recovery.
+  const resumeCapable = opts?.streaming === true;
+  const RESUME_MAX_CEILING = 5;
+  const resumeRaw = Number(env.DEVIN_CONNECT_STREAM_RESUME_MAX);
+  const resumeMax = !resumeCapable ? 0
+    : Number.isFinite(resumeRaw) && resumeRaw >= 0 ? Math.min(resumeRaw, RESUME_MAX_CEILING) : 2;
+  let resumeAttempt = 0;
+  let producedText = '';
+  let producedReasoning = '';
   let rescueAttempt = 0;
   let emptyAttempt = 0;
   for (;;) {
@@ -414,7 +444,9 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
         ),
       }
       : upstreamParams;
-    for await (const ev of streamChatImpl(callParams)) {
+    let streamErr = null;
+    try {
+      for await (const ev of streamChatImpl(callParams)) {
       if ((ev.type === 'content' || ev.type === 'reasoning') && leakTraceEnabled(env)) {
         log.info('LEAK_TRACE stream-event', {
           channel: ev.type,
@@ -431,6 +463,7 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
           sawContent = true;
           sawReasoning = true;
           sawReasoningText += routed.thinking;
+          producedReasoning += routed.thinking;
           if (rescuePossible && !sawText) pendingReasoning.push(routed.thinking);
           else yield { type: 'reasoning', text: routed.thinking };
         }
@@ -443,6 +476,7 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
           if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
           sawContent = true;
           sawText = true;
+          producedText += routed.text;
           yield { type: 'content', text: routed.text };
         }
       } else if (ev.type === 'content' || ev.type === 'reasoning') {
@@ -454,9 +488,11 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
             pendingReasoning = [];
             if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
             sawText = true;
+            producedText += ev.text;
           } else {
             sawReasoning = true;
             sawReasoningText += ev.text;
+            producedReasoning += ev.text;
             if (rescuePossible && !sawText) {
               pendingReasoning.push(ev.text);
               continue;
@@ -471,6 +507,32 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
       } else {
         yield ev;
       }
+      }
+    } catch (err) {
+      streamErr = err;
+    }
+    if (streamErr) {
+      // Pre-content death propagates to the caller's whole-request retry /
+      // account failover — echoing nothing + "continue" would just re-issue
+      // the same prompt with extra words. Resume only once upstream has
+      // produced something worth continuing from.
+      const produced = producedText.length + producedReasoning.length;
+      if (resumeAttempt < resumeMax && produced > 0 && isRetryable(streamErr) && streamErr?.name !== 'AbortError') {
+        resumeAttempt++;
+        log.warn(`DEVIN_CONNECT: stream truncated mid-response (${streamErr.code || streamErr.message}) after ${produced} produced chars — resume ${resumeAttempt}/${resumeMax} (assistant echo + "continue")`);
+        // Rebuild from the ORIGINAL request every hop (params is never
+        // mutated): the accumulated produced* covers every prior segment, so
+        // one echo + one continue is always the whole story.
+        const echo = { role: 'assistant', content: producedText };
+        if (producedReasoning) echo.reasoning_content = producedReasoning;
+        attemptParams = {
+          ...params,
+          messages: [...(params?.messages || []), echo, { role: 'user', content: 'continue' }],
+          toolChoice: undefined,
+        };
+        continue;
+      }
+      throw streamErr;
     }
     // Flush anything the classifier still holds BEFORE the rescue decision: an
     // unterminated/undecided tail is delivered as text (visible beats dropped),
@@ -485,6 +547,7 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
         if (pendingSignature) { yield { type: 'signature', reasoning_signature: pendingSignature }; pendingSignature = ''; }
         sawContent = true;
         sawText = true;
+        producedText += rest;
         yield { type: 'content', text: rest };
       }
     }
@@ -542,6 +605,10 @@ async function* streamChatWithEmptyRetry(params, { env = process.env } = {}, opt
       // streamChatCompletion reset their accumulators per THEIR OWN attempt, but the
       // rescue loop lives in here, so they never saw an attempt boundary.
       yield { type: 'attempt_reset' };
+      // attempt_reset means the client discarded the answer; the echo basis
+      // for any later resume is the replacement attempt's output only.
+      producedText = '';
+      producedReasoning = '';
       continue;
     }
 
@@ -1016,7 +1083,7 @@ export async function streamChatCompletion(params, send, opts = {}) {
   // Account failover stays in the handler.
   for (let attempt = 0; ; attempt++) {
     try {
-      for await (const ev of streamChatWithEmptyRetry(params, undefined, opts)) {
+      for await (const ev of streamChatWithEmptyRetry(params, undefined, { ...opts, streaming: true })) {
         // A rescue attempt REPLACES the previous one. The generator holds
         // reasoning while an attempt can still be rescued, so no abandoned
         // reasoning delta ever reaches this consumer; the accumulators are
